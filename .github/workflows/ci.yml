@@ -1,5 +1,8 @@
 name: ci
 
+# Every job below runs a script from test/ that also runs locally
+# (bash test/test-<name>.sh); the workflow only provides the environment.
+
 on:
   push:
     branches: [main]
@@ -11,72 +14,110 @@ permissions:
 
 jobs:
   # ---------------------------------------------------------------------------
-  # Static checks on the shell scripts.
+  # Static checks: shell scripts, Python scripts, workflow files.
   # ---------------------------------------------------------------------------
   lint:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
       - name: ShellCheck
-        run: shellcheck scripts/*.sh
+        run: shellcheck scripts/*.sh test/*.sh containers/*.sh
+      - name: ruff (Python scripts)
+        run: pipx run --spec 'ruff==0.16.7' ruff check scripts
+      # github.job_workflow_sha (the ref check.yml checks itself out at) is a
+      # documented context property that actionlint does not know yet:
+      # https://github.com/rhysd/actionlint/issues/671
+      - name: actionlint (workflow files)
+        run: |
+          set -euo pipefail
+          curl -fsSL https://github.com/rhysd/actionlint/releases/download/v1.7.7/actionlint_1.7.7_linux_amd64.tar.gz \
+            | tar -xz -C "$RUNNER_TEMP" actionlint
+          "$RUNNER_TEMP/actionlint" -color \
+            -ignore 'property "job_workflow_sha" is not defined'
 
   # ---------------------------------------------------------------------------
-  # Unit-test the distro/policy resolution logic.
+  # Unit tests that need nothing but bash and python3.
   # ---------------------------------------------------------------------------
-  resolve:
+  unit:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
-      - name: distro=auto derives from base ref
+      - name: resolve-distro.sh / resolve-policy.sh
+        run: bash test/test-resolve.sh
+      - name: parse-related-prs.py
+        run: bash test/test-related-prs.sh
+      - name: locate-library.sh
+        run: bash test/test-locate-library.sh
+      - name: colcon-build.sh (stub colcon / rosdep)
+        run: bash test/test-colcon-build.sh
+
+  # ---------------------------------------------------------------------------
+  # sync-upstream.py against local git repositories (test/sync-upstream-fixture.sh).
+  # ---------------------------------------------------------------------------
+  sync-upstream:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      # Install vcstool exactly the way the runtime images get it: the
+      # python3-vcstool Debian package from the ROS apt repository. It is not in
+      # Ubuntu's own archive, and the PyPI release (0.3.0, 2021) imports
+      # pkg_resources, which current setuptools no longer provides, so a pip or
+      # pipx install starts up broken.
+      - name: Install vcstool from the ROS apt repository
         env:
-          INPUT_DISTRO: auto
+          GH_TOKEN: ${{ github.token }}
         run: |
-          # GITHUB_* env vars are reserved and ignored when set via env:,
-          # so export the base ref inside the shell for the child process.
-          export GITHUB_BASE_REF=jazzy
-          out="$(bash scripts/resolve-distro.sh)"
-          echo "$out"
-          echo "$out" | grep -q "Resolved distro: jazzy"
-      - name: explicit distro wins
+          sudo -E bash containers/install-ros-apt-source.sh
+          sudo apt-get install -y python3-vcstool python3-yaml
+          vcs --version
+      - name: sync-upstream.py
+        run: bash test/test-sync-upstream.sh
+
+  # ---------------------------------------------------------------------------
+  # Smoke-test the source-image toolchain on every base image in minutes
+  # instead of hours: the same install-ros-apt-source.sh and ros-dev-tools
+  # setup as containers/source.Dockerfile, then build-underlay.sh on a one-file
+  # CMake package. Catches toolchain drift on a new Ubuntu release (Python,
+  # EmPy, colcon, coreutils) before the nightly image build hits it.
+  # ---------------------------------------------------------------------------
+  source-toolchain:
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        # distro -> BASE_IMAGE pairs as in containers/distro-args.sh (a job's
+        # container image cannot be computed by a step).
+        include:
+          - distro: humble
+            base: jammy
+          - distro: jazzy
+            base: noble
+          - distro: kilted
+            base: noble
+          - distro: lyrical
+            base: '26.04'
+          - distro: rolling
+            base: '26.04'
+    container:
+      image: docker.io/library/ubuntu:${{ matrix.base }}
+    # Inside a bare container the runner defaults to `sh -e`; the scripts use
+    # bash features.
+    defaults:
+      run:
+        shell: bash
+    env:
+      DEBIAN_FRONTEND: noninteractive
+      LANG: en_US.UTF-8
+    steps:
+      - uses: actions/checkout@v4
+      - name: Set locale and enable the ROS 2 apt repository (as the Dockerfile does)
         env:
-          INPUT_DISTRO: humble
+          GH_TOKEN: ${{ github.token }}
         run: |
-          export GITHUB_BASE_REF=rolling
-          bash scripts/resolve-distro.sh | grep -q "Resolved distro: humble"
-      - name: unsupported distro fails
-        env:
-          INPUT_DISTRO: bogus
-        run: |
-          if bash scripts/resolve-distro.sh; then
-            echo "expected failure for unsupported distro"; exit 1
-          fi
-      - name: rolling -> advisory -> fail-on none
-        env:
-          INPUT_POLICY: auto
-          DISTRO: rolling
-        run: |
-          out="$(bash scripts/resolve-policy.sh)"
-          echo "$out"
-          echo "$out" | grep -q "Resolved policy:  advisory"
-          echo "$out" | grep -q "Resolved fail-on: none"
-      - name: released distro -> strict -> fail-on incompatible
-        env:
-          INPUT_POLICY: auto
-          DISTRO: humble
-        run: |
-          out="$(bash scripts/resolve-policy.sh)"
-          echo "$out"
-          echo "$out" | grep -q "Resolved policy:  strict"
-          echo "$out" | grep -q "Resolved fail-on: incompatible"
-      - name: lyrical (released) -> strict -> fail-on incompatible
-        env:
-          INPUT_POLICY: auto
-          DISTRO: lyrical
-        run: |
-          out="$(bash scripts/resolve-policy.sh)"
-          echo "$out"
-          echo "$out" | grep -q "Resolved policy:  strict"
-          echo "$out" | grep -q "Resolved fail-on: incompatible"
+          bash containers/install-ros-apt-source.sh
+          apt-get install -y ros-dev-tools
+      - name: build-underlay.sh / finalize-source-image.sh on a one-package workspace
+        run: bash test/test-source-toolchain.sh
 
   # ---------------------------------------------------------------------------
   # End-to-end self-test of the composite action against the toy fixture.
@@ -98,6 +139,8 @@ jobs:
             -o out/additions.so
           g++ -g -Og -fPIC -shared -Iinclude -DBREAK_ABI src/counter.cpp \
             -o out/breaking.so
+          g++ -g -Og -fPIC -shared -Iinclude -DPRIVATE_CHANGE src/counter.cpp \
+            -o out/private.so
 
       - name: Additions under strict policy -> additions-only, passes
         id: additions
@@ -111,9 +154,34 @@ jobs:
           comment-pr: 'false'
 
       - name: Assert additions-only
+        env:
+          VERDICT: ${{ steps.additions.outputs.verdict }}
         run: |
-          echo "verdict=${{ steps.additions.outputs.verdict }}"
-          [[ "${{ steps.additions.outputs.verdict }}" == "additions-only" ]]
+          echo "verdict=$VERDICT"
+          [[ "$VERDICT" == "additions-only" ]]
+
+      # The pimpl class in src/counter_impl.hpp changed layout and lost a
+      # member function. src/ is not installed, so under the default
+      # public-headers-regexp this is implementation detail, not a break; with
+      # the std:: entries of ros-default.abignore nothing at all is left to
+      # report, so the verdict is compatible, not merely additions-only.
+      - name: Private-header change under strict policy -> compatible, passes
+        id: private
+        uses: ./
+        with:
+          package: toy-private
+          library: libtoy_ros_pkg.so
+          base-lib: test/fixtures/toy-ros-pkg/out/base.so
+          head-lib: test/fixtures/toy-ros-pkg/out/private.so
+          policy: strict
+          comment-pr: 'false'
+
+      - name: Assert compatible (private change filtered)
+        env:
+          VERDICT: ${{ steps.private.outputs.verdict }}
+        run: |
+          echo "verdict=$VERDICT"
+          [[ "$VERDICT" == "compatible" ]]
 
       - name: Breaking under advisory policy -> incompatible, passes
         id: advisory
@@ -127,9 +195,11 @@ jobs:
           comment-pr: 'false'
 
       - name: Assert incompatible (advisory did not fail)
+        env:
+          VERDICT: ${{ steps.advisory.outputs.verdict }}
         run: |
-          echo "verdict=${{ steps.advisory.outputs.verdict }}"
-          [[ "${{ steps.advisory.outputs.verdict }}" == "incompatible" ]]
+          echo "verdict=$VERDICT"
+          [[ "$VERDICT" == "incompatible" ]]
 
       - name: Breaking under strict policy -> should fail the step
         id: strict
@@ -144,8 +214,11 @@ jobs:
           comment-pr: 'false'
 
       - name: Assert strict policy failed on the break
+        env:
+          OUTCOME: ${{ steps.strict.outcome }}
+          VERDICT: ${{ steps.strict.outputs.verdict }}
         run: |
-          echo "outcome=${{ steps.strict.outcome }}"
-          echo "verdict=${{ steps.strict.outputs.verdict }}"
-          [[ "${{ steps.strict.outcome }}" == "failure" ]]
-          [[ "${{ steps.strict.outputs.verdict }}" == "incompatible" ]]
+          echo "outcome=$OUTCOME"
+          echo "verdict=$VERDICT"
+          [[ "$OUTCOME" == "failure" ]]
+          [[ "$VERDICT" == "incompatible" ]]

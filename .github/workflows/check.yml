@@ -1,9 +1,9 @@
 name: ROS 2 ABI Check
 
-# Reusable workflow that builds a ROS 2 package twice (PR target branch + PR
-# head) in the matching distro container, then delegates the ABI diff to
-# fujitatomoya/libabigail-action via this repo's composite action. REP-0009
-# policy is applied automatically from the PR's target branch.
+# Reusable workflow that builds one or more ROS 2 packages twice (PR target
+# branch + PR head) in the matching distro container, then delegates the ABI
+# diff to fujitatomoya/libabigail-action via this repo's composite action.
+# REP-0009 policy is applied automatically from the PR's target branch.
 #
 # Consumers call it like:
 #
@@ -14,12 +14,49 @@ name: ROS 2 ABI Check
 #         package: rclcpp
 #         soname: librclcpp.so
 #         suppressions: .abignore
+#
+# Multi-package repositories list every package whose libraries should be
+# checked; they are built together in a single colcon invocation:
+#
+#       with:
+#         package: rclcpp rclcpp_action rclcpp_components rclcpp_lifecycle
+#         soname: 'lib*.so'
+#
+# ROS 2 core repositories develop against the source branches of their
+# dependencies, which are usually ahead of the released binaries. They must
+# use build-mode: source, which imports the distro's ros2.repos and builds
+# the PR against today's source tree (a nightly source-built underlay,
+# ros-abi:<distro>-source, caches whatever did not move since):
+#
+#       with:
+#         package: rclcpp rclcpp_action rclcpp_components rclcpp_lifecycle
+#         soname: 'lib*.so'
+#         build-mode: source
+#
+# Paired changes across repositories are declared by the PR author in the PR
+# description and are applied to the PR side of the build:
+#
+#   Depends-On: ros2/rcl#1234
+#
+# Pull requests from forks run with a read-only token, so the diff jobs cannot
+# post the comment and labels themselves. Repositories that take fork pull
+# requests set `publish: workflow-run` here and add a second, three-line
+# workflow on report.yml (see there) that publishes the verdicts afterwards.
+#
+# Permissions are inherited from the caller (no `permissions:` block here so
+# callers can narrow them): `contents: read` is enough with
+# `publish: workflow-run`; `publish: inline` also needs `pull-requests: write`
+# and `issues: write`.
 
 on:
   workflow_call:
     inputs:
       package:
-        description: 'Colcon package name to build (e.g. rclcpp).'
+        description: >-
+          Colcon package name(s) to build. Space-separated for multi-package
+          repos (e.g. "rclcpp rclcpp_action rclcpp_lifecycle"); all names go
+          to one colcon --packages-up-to, so the union of their dependency
+          closures is built exactly once per side.
         required: true
         type: string
       soname:
@@ -31,11 +68,48 @@ on:
         required: false
         type: string
         default: 'auto'
+      build-mode:
+        description: >-
+          binary (default): build against the released ros-<distro> Debian
+          packages; right for downstream packages. source: import the distro's
+          ros2.repos and build against today's source tree; required for ROS 2
+          core repositories whose dependencies are ahead of the binaries.
+        required: false
+        type: string
+        default: 'binary'
+      source-strategy:
+        description: >-
+          Source mode only. incremental (default): recompile only the upstream
+          packages that moved since the nightly <image-prefix>:<distro>-source
+          image was built (plus their dependents and the targets), taking the
+          rest from the image. scratch: ignore the prebuilt underlay and compile
+          the whole dependency closure from source in the same image; slower,
+          no cache.
+        required: false
+        type: string
+        default: 'incremental'
+      related-prs:
+        description: >-
+          Additional related pull requests to apply on the PR side, as
+          "owner/repo#N" or PR URLs (whitespace or comma separated). Merged
+          with the "Depends-On:" lines parsed from the PR description.
+        required: false
+        type: string
+        default: ''
       suppressions:
         description: 'Path to a suppression file relative to the repo root.'
         required: false
         type: string
         default: ''
+      public-headers-regexp:
+        description: >-
+          Only declarations from files whose path matches this regular
+          expression are ABI; the rest is implementation and may change
+          freely (pimpl). The default encodes the ROS 2 layout, where
+          installed headers live under include/. '' turns the filter off.
+        required: false
+        type: string
+        default: '(^|/)include/'
       policy:
         description: 'auto | strict (fail on break) | advisory (warn only).'
         required: false
@@ -46,18 +120,28 @@ on:
         required: false
         type: string
         default: ''
+      publish:
+        description: >-
+          inline (default): every diff job posts its own sticky comment and the
+          labels; works for pull requests from the same repository only.
+          workflow-run: post nothing here and leave it to report.yml, called
+          from a workflow_run workflow, which publishes one comment for all
+          libraries and works for fork pull requests as well.
+        required: false
+        type: string
+        default: 'inline'
       comment-pr:
-        description: 'Post / update a sticky comment on the pull request.'
+        description: 'Post / update a sticky comment on the pull request (publish: inline only).'
         required: false
         type: boolean
         default: true
       label-compat:
-        description: 'Label applied when ABI is compatible / additions-only.'
+        description: 'Label applied when ABI is compatible / additions-only (publish: inline only).'
         required: false
         type: string
         default: 'ABI compatible'
       label-break:
-        description: 'Label applied when ABI is incompatible.'
+        description: 'Label applied when ABI is incompatible (publish: inline only).'
         required: false
         type: string
         default: 'ABI break'
@@ -67,22 +151,20 @@ on:
         type: string
         default: 'ghcr.io/fujitatomoya/ros-abi'
 
-permissions:
-  contents: read
-  pull-requests: write
-  issues: write
-
 jobs:
   # ---------------------------------------------------------------------------
-  # Resolve distro -> container image and policy -> fail-on once, up front.
+  # Resolve distro -> container image and the related PRs once, up front.
+  # (The REP-0009 policy is resolved by the composite action in the diff job,
+  # from the distro resolved here.)
   # ---------------------------------------------------------------------------
   resolve:
     runs-on: ubuntu-latest
     outputs:
       distro: ${{ steps.distro.outputs.distro }}
+      build-mode: ${{ steps.distro.outputs.build-mode }}
+      source-strategy: ${{ steps.distro.outputs.source-strategy }}
       image: ${{ steps.distro.outputs.image }}
-      policy: ${{ steps.policy.outputs.policy }}
-      fail-on: ${{ steps.policy.outputs.fail-on }}
+      related-prs: ${{ steps.related.outputs.related-prs }}
     steps:
       - name: Checkout ros2-abi-action
         uses: actions/checkout@v4
@@ -91,22 +173,38 @@ jobs:
           ref: ${{ github.job_workflow_sha }}
           path: ._ros2-abi-action
 
+      - name: Validate publish mode
+        env:
+          PUBLISH: ${{ inputs.publish }}
+        run: |
+          case "$PUBLISH" in
+            inline|workflow-run) echo "publish=$PUBLISH" ;;
+            *)
+              echo "::error::Unknown publish value: '$PUBLISH' (expected: inline | workflow-run)"
+              exit 1
+              ;;
+          esac
+
       - name: Resolve distro and image
         id: distro
         env:
           INPUT_DISTRO: ${{ inputs.distro }}
           IMAGE_PREFIX: ${{ inputs.image-prefix }}
+          BUILD_MODE: ${{ inputs.build-mode }}
+          SOURCE_STRATEGY: ${{ inputs.source-strategy }}
         run: bash ._ros2-abi-action/scripts/resolve-distro.sh
 
-      - name: Resolve policy
-        id: policy
+      # The PR body is untrusted input: it is passed through the environment,
+      # never interpolated into a script, and only yields owner/repo#N tokens.
+      - name: Parse related pull requests (Depends-On)
+        id: related
         env:
-          INPUT_POLICY: ${{ inputs.policy }}
-          DISTRO: ${{ steps.distro.outputs.distro }}
-        run: bash ._ros2-abi-action/scripts/resolve-policy.sh
+          PR_BODY: ${{ github.event.pull_request.body }}
+          RELATED_PRS_INPUT: ${{ inputs.related-prs }}
+        run: python3 ._ros2-abi-action/scripts/parse-related-prs.py
 
   # ---------------------------------------------------------------------------
-  # Build the package twice: against the PR target branch and the PR head.
+  # Build the package(s) twice: against the PR target branch and the PR head.
   # ---------------------------------------------------------------------------
   build:
     needs: resolve
@@ -143,19 +241,44 @@ jobs:
           set -euo pipefail
           vcs import src < "src/pkg/${{ inputs.upstream-workspace }}"
 
+      # Source mode: import the distro manifest (minus the repository under
+      # test, already at ws/src/pkg) and work out which upstream repositories
+      # moved since the underlay image was built. Both modes: check out the
+      # related PRs declared in the PR description, on the PR side only, so the
+      # base side stays the pre-PR world.
+      - name: Sync upstream sources and related pull requests
+        if: needs.resolve.outputs.build-mode == 'source' || (matrix.side == 'pr' && needs.resolve.outputs.related-prs != '')
+        id: sync
+        working-directory: ws
+        env:
+          MODE: ${{ needs.resolve.outputs.build-mode }}
+          STRATEGY: ${{ needs.resolve.outputs.source-strategy }}
+          EXCLUDE_REPO: ${{ github.repository }}
+          ROS_DISTRO: ${{ needs.resolve.outputs.distro }}
+          RELATED_PRS: ${{ matrix.side == 'pr' && needs.resolve.outputs.related-prs || '' }}
+        run: |
+          export WORKSPACE_SRC="$GITHUB_WORKSPACE/ws/src"
+          export DEST="$WORKSPACE_SRC/upstream"
+          python3 "$GITHUB_WORKSPACE/._ros2-abi-action/scripts/sync-upstream.py"
+
       - name: Restore ccache
         uses: actions/cache@v4
         with:
           path: .ccache
-          key: abi-ccache-${{ needs.resolve.outputs.distro }}-${{ matrix.side }}-${{ hashFiles('ws/src/**/package.xml', 'ws/src/**/*.repos') }}
+          key: abi-ccache-${{ needs.resolve.outputs.distro }}-${{ needs.resolve.outputs.build-mode }}-${{ matrix.side }}-${{ hashFiles('ws/src/**/package.xml', 'ws/src/**/*.repos') }}
           restore-keys: |
-            abi-ccache-${{ needs.resolve.outputs.distro }}-${{ matrix.side }}-
+            abi-ccache-${{ needs.resolve.outputs.distro }}-${{ needs.resolve.outputs.build-mode }}-${{ matrix.side }}-
 
+      # Incremental source builds keep the DDS vendors from the nightly image
+      # even when their repositories moved (colcon-build.sh's default
+      # PACKAGES_SKIP_REGEX); scratch builds compile them like everything else.
       - name: Build
         working-directory: ws
         env:
           PACKAGE: ${{ inputs.package }}
           ROS_DISTRO: ${{ needs.resolve.outputs.distro }}
+          SOURCE_STRATEGY: ${{ needs.resolve.outputs.source-strategy }}
+          REBUILD_PATHS: ${{ steps.sync.outputs.rebuild-paths }}
         run: |
           # In container jobs ${{ github.workspace }} is the host path, but the
           # workspace is mounted at $GITHUB_WORKSPACE inside the container, so
@@ -164,13 +287,18 @@ jobs:
           export CCACHE_DIR="$GITHUB_WORKSPACE/.ccache"
           bash "$GITHUB_WORKSPACE/._ros2-abi-action/scripts/colcon-build.sh"
 
+      # Only the packages under test are diffed: with PACKAGE set (and no
+      # SEARCH_DIR) locate-library.sh searches their install prefixes only, so
+      # dependencies rebuilt from source in this workspace are not picked up
+      # by the soname glob.
       - name: Locate built library/libraries
         working-directory: ws
         env:
           SONAME: ${{ inputs.soname }}
-          SEARCH_DIR: install
+          PACKAGE: ${{ inputs.package }}
+          SIDE: ${{ matrix.side }}
         run: |
-          export COPY_TO="$GITHUB_WORKSPACE/abi-artifacts/${{ matrix.side }}"
+          export COPY_TO="$GITHUB_WORKSPACE/abi-artifacts/$SIDE"
           bash "$GITHUB_WORKSPACE/._ros2-abi-action/scripts/locate-library.sh"
 
       - name: Upload library artifact
@@ -214,8 +342,10 @@ jobs:
           echo "Libraries to diff: $libs"
 
   # ---------------------------------------------------------------------------
-  # Diff each library; one job per matched library so per-library comments
-  # coexist and any incompatible library fails the workflow under strict policy.
+  # Diff each library; one job per matched library so any incompatible library
+  # fails the workflow under strict policy. Each job uploads a report bundle
+  # (abidiff-report.txt + verdict.json) named abidiff-<packages>-<library>;
+  # with publish: workflow-run those bundles are all report.yml needs.
   # ---------------------------------------------------------------------------
   diff:
     needs: [resolve, build, collect]
@@ -250,17 +380,10 @@ jobs:
           name: lib-pr
           path: lib-pr
 
-      - name: Resolve suppressions path
-        id: suppr
-        env:
-          SUPPRESSIONS: ${{ inputs.suppressions }}
-        run: |
-          path=""
-          if [[ -n "$SUPPRESSIONS" && -f "caller/$SUPPRESSIONS" ]]; then
-            path="caller/$SUPPRESSIONS"
-          fi
-          echo "path=$path" >> "$GITHUB_OUTPUT"
-
+      # The action resolves the REP-0009 policy from the distro and merges the
+      # suppressions itself (a missing suppressions file is reported as a
+      # warning there). With publish: workflow-run the in-job comment and
+      # labels are switched off; report.yml posts them from the artifacts.
       - name: ABI diff for ${{ matrix.library }}
         uses: ./._ros2-abi-action
         with:
@@ -269,8 +392,9 @@ jobs:
           base-lib: lib-base/${{ matrix.library }}
           head-lib: lib-pr/${{ matrix.library }}
           distro: ${{ needs.resolve.outputs.distro }}
-          policy: ${{ needs.resolve.outputs.policy }}
-          suppressions: ${{ steps.suppr.outputs.path }}
-          comment-pr: ${{ inputs.comment-pr }}
-          label-compat: ${{ inputs.label-compat }}
-          label-break: ${{ inputs.label-break }}
+          policy: ${{ inputs.policy }}
+          suppressions: ${{ inputs.suppressions != '' && format('caller/{0}', inputs.suppressions) || '' }}
+          public-headers-regexp: ${{ inputs.public-headers-regexp }}
+          comment-pr: ${{ inputs.publish == 'inline' && inputs.comment-pr }}
+          label-compat: ${{ inputs.publish == 'inline' && inputs.label-compat || '' }}
+          label-break: ${{ inputs.publish == 'inline' && inputs.label-break || '' }}

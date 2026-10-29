@@ -7,7 +7,7 @@ branding:
 
 inputs:
   package:
-    description: 'Colcon package name the library belongs to (used in the report).'
+    description: 'Colcon package name(s) the library belongs to (used in the report name; whitespace is sanitized).'
     required: true
   library:
     description: 'Resolved library file name being diffed (e.g. librclcpp.so).'
@@ -30,6 +30,15 @@ inputs:
     description: 'Path to a per-repo suppression file (merged with the ROS default).'
     required: false
     default: ''
+  public-headers-regexp:
+    description: >-
+      Only declarations from files whose path matches this regular expression
+      are ABI; everything else (headers under src/, types local to a .cpp) is
+      implementation and may change freely (pimpl). The default encodes the
+      ROS 2 layout: installed headers live under include/. Set to '' to turn
+      the filter off.
+    required: false
+    default: '(^|/)include/'
   comment-pr:
     description: 'Post / update a sticky comment on the pull request.'
     required: false
@@ -91,33 +100,54 @@ runs:
         OUTPUT: ${{ runner.temp }}/ros2-abi-suppressions.txt
       run: bash "$GITHUB_ACTION_PATH/scripts/merge-suppressions.sh"
 
-    - name: Compute marker suffix
+    - name: Compute marker suffix and report name
       id: marker
       shell: bash
       env:
         MARKER_SUFFIX: ${{ inputs.marker-suffix }}
+        PACKAGE: ${{ inputs.package }}
         LIBRARY: ${{ inputs.library }}
       run: |
         suffix="${MARKER_SUFFIX:-}"
         if [[ -z "$suffix" ]]; then
           # Derive a stable, comment-marker-safe suffix from the library name.
-          suffix="abi-$(echo "$LIBRARY" | tr -c 'A-Za-z0-9._-' '-')"
+          suffix="abi-$(printf '%s' "$LIBRARY" | tr -c 'A-Za-z0-9._-' '-')"
         fi
         echo "marker-suffix=$suffix" >> "$GITHUB_OUTPUT"
+
+        # The report name doubles as an artifact / file name, so it must not
+        # contain whitespace or other special characters. PACKAGE may be a
+        # space-separated list (e.g. "rclcpp rclcpp_action"), so squeeze every
+        # run of disallowed characters into a single '-'.
+        report="abidiff-$(printf '%s-%s' "$PACKAGE" "$LIBRARY" | tr -cs 'A-Za-z0-9._-' '-')"
+        echo "report-name=$report" >> "$GITHUB_OUTPUT"
 
     - name: Diff ABI (libabigail-action)
       id: diff
       # libabigail-action has no v1 yet; v0 is its floating major tag
-      # (currently -> v0.1.1). Bump when a v1 is published.
+      # (needs >= v0.3.1 for public-headers-regexp). Bump when a v1 is published.
       uses: fujitatomoya/libabigail-action@v0
       with:
         base-lib: ${{ inputs.base-lib }}
         head-lib: ${{ inputs.head-lib }}
+        library: ${{ inputs.library }}
         suppressions: ${{ steps.suppr.outputs.suppressions }}
+        # Both sides are built here with -g, so every declaration of the
+        # package is covered by DWARF. ELF symbols without debug info are
+        # COMDAT template instantiations from libstdc++ (std::variant,
+        # std::function, ...) whose mangled names change whenever a template
+        # argument list changes; suppression specs cannot match them and
+        # abidiff would count a renamed one as a removed symbol, i.e. an ABI
+        # break. They are not part of any ROS package's ABI, so leave them out.
+        unreferenced-symbols: 'false'
+        # "Installed headers are the public ABI": types defined outside
+        # include/ are ignored when reached through a pointer or reference,
+        # and member functions of such classes may come and go (pimpl).
+        public-headers-regexp: ${{ inputs.public-headers-regexp }}
         fail-on: ${{ steps.policy.outputs.fail-on }}
         comment-pr: ${{ inputs.comment-pr }}
         label-compat: ${{ inputs.label-compat }}
         label-break: ${{ inputs.label-break }}
-        report-name: abidiff-${{ inputs.package }}-${{ inputs.library }}
+        report-name: ${{ steps.marker.outputs.report-name }}
         marker-suffix: ${{ steps.marker.outputs.marker-suffix }}
         github-token: ${{ inputs.github-token }}

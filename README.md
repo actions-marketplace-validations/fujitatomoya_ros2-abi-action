@@ -4,7 +4,7 @@
 [![License: Apache-2.0](https://img.shields.io/badge/License-Apache_2.0-blue.svg)](LICENSE)
 
 ROS-aware ABI compliance checking for C/C++ shared libraries on every pull
-request. `ros2-abi-action` builds a ROS 2 package **twice** — once against the
+request. `ros2-abi-action` builds one or more ROS 2 packages **twice** — once against the
 PR's target branch and once against the PR head — in the matching distro
 container, then delegates the binary ABI diff to
 [`fujitatomoya/libabigail-action`](https://github.com/fujitatomoya/libabigail-action)
@@ -14,6 +14,9 @@ It applies [REP-0009](https://ros.org/reps/rep-0009.html) policy automatically
 from the PR's target branch: **released distros must not break ABI**, while
 **rolling is advisory only**. Results surface as a sticky PR comment, labels,
 and a pass/fail check, so maintainers can decide on backports at a glance.
+Pull requests from forks are covered too: a second, three-line workflow
+publishes their comment and labels after the check run (see
+[Pull requests from forks](#pull-requests-from-forks)).
 
 This is **Action 2** of a two-action design:
 
@@ -54,6 +57,53 @@ jobs:
 That is the entire integration burden per repo. The distro is derived from the
 PR's target branch; policy follows REP-0009.
 
+For a repository that contains several packages, list them all in `package`
+(space-separated) and use a `soname` glob. Everything is built once per side
+and each matched library is diffed in its own job.
+
+**ROS 2 core repositories** (`rclcpp`, `rcl`, `rmw`, …) must additionally set
+`build-mode: source`, because their dependencies' source branches are usually
+ahead of the released binaries (see [Build modes](#build-modes-binary-vs-source)):
+
+```yaml
+    with:
+      package: rclcpp rclcpp_action rclcpp_components rclcpp_lifecycle
+      soname: 'lib*.so'
+      build-mode: source
+```
+
+**Repositories that receive pull requests from forks** (every ROS 2 core
+repository does) add `publish: workflow-run` and a second workflow file, so the
+comment and labels are posted with a token that is allowed to write them:
+
+```yaml
+# .github/workflows/abi.yml            (as above, plus:)
+    permissions:
+      contents: read                    # nothing is written from this workflow
+    with:
+      publish: workflow-run
+```
+
+```yaml
+# .github/workflows/abi-report.yml
+name: abi-report
+on:
+  workflow_run:
+    workflows: [abi]                    # the `name:` of abi.yml
+    types: [completed]
+
+jobs:
+  report:
+    permissions:
+      contents: read
+      pull-requests: write
+      issues: write
+      actions: read
+    uses: fujitatomoya/ros2-abi-action/.github/workflows/report.yml@v1
+```
+
+See [Pull requests from forks](#pull-requests-from-forks) for why.
+
 ---
 
 ## How it works
@@ -62,25 +112,44 @@ PR's target branch; policy follows REP-0009.
 flowchart LR
     A[PR opened/updated] --> R[resolve<br/>distro + policy]
     R --> B1[build base<br/>target branch]
-    R --> B2[build pr<br/>head commit]
+    R --> B2[build pr<br/>head commit + Depends-On PRs]
     B1 --> C[collect<br/>expand soname glob]
     B2 --> C
     C --> D[diff per library<br/>libabigail-action]
-    D --> E[PR comment + label + check]
+    D --> E[pass/fail check<br/>+ report artifacts]
+    E -->|publish: inline<br/>same-repo PRs| F[PR comment + labels<br/>from the diff jobs]
+    E -->|publish: workflow-run<br/>any PR, incl. forks| G[report.yml on workflow_run<br/>one comment + labels]
 ```
 
 1. **resolve** — derive the distro from `GITHUB_BASE_REF` (or the explicit
-   `distro` input) and look up the container image; resolve the policy.
+   `distro` input) and look up the container image for the requested
+   `build-mode` / `source-strategy`; resolve the policy; parse `Depends-On:`
+   lines from the PR description.
 2. **build** (matrix `base` + `pr`) — inside the distro container: check out the
-   correct ref, optionally `vcs import` a `.repos` file, `rosdep install`, then
-   `colcon build --packages-up-to <package>` with `-DCMAKE_BUILD_TYPE=Debug`
-   and `-g -Og` so DWARF is present. The matched library/libraries are uploaded
+   correct ref, optionally `vcs import` a `.repos` file, in source mode import
+   `ros2.repos` and detect which repositories moved since the image was built,
+   on the PR side check out the related PRs, source the image's underlay (so
+   `rosdep` treats the packages it provides as satisfied), `rosdep install`
+   for the packages in the build closure, then
+   `colcon build --packages-up-to <package...>` with `-DCMAKE_BUILD_TYPE=Debug`
+   and `-g -Og` so DWARF is present. When `package` lists several names, colcon
+   builds the union of their dependency closures in one invocation, so shared
+   dependencies are compiled once. The matched library/libraries are uploaded
    as the `lib-base` / `lib-pr` artifacts. `install/` builds are sped up with
-   `ccache` keyed on `(distro, package.xml, .repos, side)`.
+   `ccache` keyed on `(distro, build-mode, package.xml, .repos, side)`.
 3. **collect** — expand the `soname` glob into a concrete list of libraries.
 4. **diff** (matrix, one job per library) — download both artifacts, merge the
    default ROS suppression spec with the repo's `.abignore`, and invoke
-   `libabigail-action` with `fail-on` set from the resolved policy.
+   `libabigail-action` with `fail-on` set from the resolved policy and the
+   [public-headers rule](#public-abi-installed-headers) (`include/` is the
+   ABI, `src/` is not). Each job
+   uploads a report bundle (`abidiff-report.txt` + `verdict.json`) named
+   `abidiff-<packages>-<library>`.
+5. **publish** — with `publish: inline` each diff job posts its own sticky
+   comment and the labels (same-repository pull requests only). With
+   `publish: workflow-run` nothing is posted here; the caller's `abi-report`
+   workflow runs [`report.yml`](.github/workflows/report.yml) once the check
+   run completes and posts one comment covering every library, plus the labels.
 
 ---
 
@@ -88,43 +157,189 @@ flowchart LR
 
 | Input | Required | Default | Description |
 | --- | --- | --- | --- |
-| `package` | yes | — | Colcon package name to build (e.g. `rclcpp`). |
+| `package` | yes | — | Colcon package name(s) to build. Space-separated for multi-package repos (e.g. `rclcpp rclcpp_action rclcpp_lifecycle`); built together via one `--packages-up-to`. |
 | `soname` | yes | — | Library file or glob (e.g. `librclcpp.so` or `lib*.so`). |
 | `distro` | no | `auto` | `auto` (derive from PR target branch) or explicit: `humble`, `jazzy`, `kilted`, `lyrical`, `rolling`, … |
+| `build-mode` | no | `binary` | `binary`: build against released `ros-<distro>-*` packages (downstream repos). `source`: import the distro's `ros2.repos` and build against today's source tree (ROS 2 core repos). |
+| `source-strategy` | no | `incremental` | Source mode only. `incremental`: nightly source underlay, recompile only what moved. `scratch`: compile the whole closure from source, no cache. |
+| `related-prs` | no | — | Extra related PRs (`owner/repo#N` or URLs) applied on the PR side, merged with the `Depends-On:` lines of the PR description. |
 | `suppressions` | no | — | Path to a suppression file relative to the repo root. |
+| `public-headers-regexp` | no | `(^|/)include/` | Regexp on source paths; only declarations from matching files are ABI, the rest is implementation (pimpl). `''` turns the rule off. See [Public ABI: installed headers](#public-abi-installed-headers). |
 | `policy` | no | `auto` | `auto` \| `strict` (fail on break) \| `advisory` (warn only). |
 | `upstream-workspace` | no | — | Path to a `.repos` file for additional source deps. |
-| `comment-pr` | no | `true` | Post / update the sticky PR comment. |
-| `label-compat` | no | `ABI compatible` | Label applied when compatible / additions-only. |
-| `label-break` | no | `ABI break` | Label applied when incompatible. |
+| `publish` | no | `inline` | `inline`: diff jobs post comment + labels themselves (same-repo PRs only). `workflow-run`: post nothing here; pair with [`report.yml`](#pull-requests-from-forks). |
+| `comment-pr` | no | `true` | Post / update the sticky PR comment (`publish: inline` only). |
+| `label-compat` | no | `ABI compatible` | Label applied when compatible / additions-only (`publish: inline` only). |
+| `label-break` | no | `ABI break` | Label applied when incompatible (`publish: inline` only). |
 | `image-prefix` | no | `ghcr.io/fujitatomoya/ros-abi` | Container image repository prefix (`<prefix>:<distro>`). |
+
+## Inputs (reusable workflow `report.yml`)
+
+| Input | Required | Default | Description |
+| --- | --- | --- | --- |
+| `comment-pr` | no | `true` | Post / update one sticky comment covering every library. |
+| `label-compat` | no | `ABI compatible` | Label applied when every library is compatible / additions-only. |
+| `label-break` | no | `ABI break` | Label applied when any library is incompatible. |
+| `artifact-pattern` | no | `abidiff-*` | Glob selecting the check run's report bundles. |
+| `marker-suffix` | no | `ros2-abi` | Sticky-comment marker suffix. |
+
+Outputs: `verdict` (worst across libraries) and `pr-number`.
+
+---
+
+## Build modes: binary vs source
+
+The package under test always comes from the PR, but its *dependencies* can
+come from two places:
+
+| `build-mode` | Dependencies come from | Use for |
+| --- | --- | --- |
+| `binary` (default) | Released `ros-<distro>-*` Debian packages in `/opt/ros/<distro>` | Downstream packages that build against a released distro (e.g. [`rcl_logging_journal`](https://github.com/fujitatomoya/rcl_logging_journal)). |
+| `source` | A source-built overlay of the ROS 2 core, plus any upstream repository that moved since the image was built | ROS 2 core repositories (`rclcpp`, `rcl`, `rmw`, `rosbag2`, …). |
+
+Core repositories cannot use `binary`: their source branches depend on API in
+sibling repositories that has not been released to the binary archive yet
+(rolling syncs are irregular, released distros only get periodic patch
+releases), so the PR fails to compile against `/opt/ros/<distro>`. The
+`ros2/rclcpp` rolling branch, for instance, needs `rcl_action` graph API that
+`ros-rolling-rcl-action` does not ship yet.
+
+In `source` mode every PR run imports the distro's
+[`ros2.repos`](https://github.com/ros2/ros2) (minus the repository under test,
+which is checked out from the PR) into the colcon workspace, so the PR is
+always compiled against **today's** source branches. Two strategies control
+how much of that tree is actually recompiled:
+
+| `source-strategy` | What gets compiled per side |
+| --- | --- |
+| `incremental` (default) | The PR's packages, every upstream package whose repository moved since the nightly image was built, everything that depends on those inside the target closure, and any upstream package the image does not provide. The rest comes prebuilt from the image. DDS vendors are always taken from the image. |
+| `scratch` | The whole dependency closure of the target packages, from source, ignoring the image's prebuilt workspace. Slower and uncached, but with no prebuilt state at all. |
+
+Both strategies run in the same `ros-abi:<distro>-source` image and produce
+the same binaries for the packages under test; the incremental one only skips
+recompiling sources that are byte-identical to what the image already built.
+
+The **nightly image** `ros-abi:<distro>-source` is built by
+[`containers/source.Dockerfile`](containers/source.Dockerfile), which follows
+the official [Ubuntu (source)](https://docs.ros.org/en/rolling/Installation/Alternatives/Ubuntu-Development-Setup.html)
+instructions step by step; the values that differ between distros (Tier 1
+Ubuntu release, development tool set, `rosdep --skip-keys`) come from
+[`containers/distro-args.sh`](containers/distro-args.sh). The build runs with
+**no binary ROS 2 installation present**, as those instructions require:
+locale, Universe and `ros2-apt-source`, the documented development tool set,
+`ros2.repos` import, `rosdep install` with the documented `--skip-keys`, and
+`colcon build` of the **entire manifest**, so every repository under
+`ros2/ros2.repos` is available as a source underlay. The build uses
+`Debug -g -Og` instead of the documented release mixin (abidiff needs DWARF;
+the flags are shared with the PR-time build through
+[`scripts/abi-build-flags.sh`](scripts/abi-build-flags.sh)), turns tests off,
+and continues past a broken package (listed in `/opt/ros2_ws/missing.txt`;
+such a package is simply rebuilt at PR time). The exact commit of every
+imported repository is recorded in `/opt/ros2_ws/snapshot.repos`.
+
+At PR time [`scripts/sync-upstream.py`](scripts/sync-upstream.py) resolves the
+current head of every manifest repository with `git ls-remote` (in parallel),
+diffs it against the snapshot, imports the manifest, and hands the moved
+repositories to [`colcon-build.sh`](scripts/colcon-build.sh), which builds with
+`--packages-up-to <targets> --packages-above <moved + targets>`. Colcon
+intersects the two selections, so an rcutils change rebuilds rcl and rclcpp
+too, while unrelated repositories stay untouched.
+
+Repositories that are not part of `ros2.repos`, or that need extra source
+dependencies, can still add them with `upstream-workspace` in either mode.
+
+---
+
+## Related pull requests (`Depends-On:`)
+
+Changes across ROS 2 repositories often land in pairs: an `rcl` PR adds an
+API and an `rclcpp` PR consumes it. Until the `rcl` PR merges, the `rclcpp` PR
+cannot compile against the `rcl` branch. Declare the dependency in the PR
+description, on its own line:
+
+```
+Depends-On: ros2/rcl#1234
+Requires: https://github.com/ros2/rmw/pull/567, ros2/rcutils#89
+```
+
+Recognised keywords are `Depends-On`, `Depends on`, `Depends`, `Requires`,
+`Needs`, `Blocked by` and `Companion` (case-insensitive, optionally after a
+list marker). References may be `owner/repo#N` or full PR URLs; several may
+share a line. Only keyword-labelled lines are considered, so `Closes …`,
+`Similar to …` and other links elsewhere in the body are ignored, and HTML
+comments from PR templates are stripped first.
+
+The referenced PRs are checked out at their merge ref (`refs/pull/N/merge`,
+falling back to `refs/pull/N/head` if the PR conflicts with its base) and
+applied to the **PR side only**. The base side stays the pre-PR world, so the
+resulting diff shows exactly the ABI effect of landing both changes. A repo
+that is in `ros2.repos` is switched to the PR ref in place; one that is not is
+cloned into the workspace, which also makes this work in `binary` mode for
+downstream packages. The `related-prs` input adds references from the calling
+workflow (useful for `workflow_dispatch`) on top of the parsed ones.
+
+Once the dependency PR merges, the line becomes a no-op: the sync step picks
+the merged commit up from the branch like any other upstream change.
 
 ---
 
 ## Distro → container map
 
-The container image is `<image-prefix>:<distro>`. The default prefix points at
-the `ros-abi` images built weekly from [`containers/`](containers/) by
-[`build-images.yml`](.github/workflows/build-images.yml): the official
-`ros:<distro>` base (binary underlay at `/opt/ros`, colcon, rosdep) plus
-`ccache` and `abigail-tools`. Missing package dependencies are installed by
-`rosdep` at build time.
+The container image is `<image-prefix>:<distro>` in binary mode and
+`<image-prefix>:<distro>-source` in source mode. The default prefix points at
+the `ros-abi` images built nightly from [`containers/`](containers/) by
+[`build-images.yml`](.github/workflows/build-images.yml). The binary images are
+the official `ros:<distro>` base (binary underlay at `/opt/ros`, colcon,
+rosdep) plus `ccache` and `abigail-tools`; the source images are plain Ubuntu
+with the whole of `ros2.repos` built from source as described above, and no
+`/opt/ros`. Missing package dependencies are installed by `rosdep` at build
+time.
 
-| Distro | Default image |
-| --- | --- |
-| `humble` | `ghcr.io/fujitatomoya/ros-abi:humble` |
-| `jazzy` | `ghcr.io/fujitatomoya/ros-abi:jazzy` |
-| `kilted` | `ghcr.io/fujitatomoya/ros-abi:kilted` |
-| `lyrical` | `ghcr.io/fujitatomoya/ros-abi:lyrical` |
-| `rolling` | `ghcr.io/fujitatomoya/ros-abi:rolling` |
+| Distro | `binary` image | `source` image |
+| --- | --- | --- |
+| `humble` | `ghcr.io/fujitatomoya/ros-abi:humble` | `ghcr.io/fujitatomoya/ros-abi:humble-source` |
+| `jazzy` | `ghcr.io/fujitatomoya/ros-abi:jazzy` | `ghcr.io/fujitatomoya/ros-abi:jazzy-source` |
+| `kilted` | `ghcr.io/fujitatomoya/ros-abi:kilted` | `ghcr.io/fujitatomoya/ros-abi:kilted-source` |
+| `lyrical` | `ghcr.io/fujitatomoya/ros-abi:lyrical` | `ghcr.io/fujitatomoya/ros-abi:lyrical-source` |
+| `rolling` | `ghcr.io/fujitatomoya/ros-abi:rolling` | `ghcr.io/fujitatomoya/ros-abi:rolling-source` |
+
+### Building a source image locally
+
+The nightly job builds the source images on 4-vCPU hosted runners, which takes
+hours. On a workstation the same Dockerfile builds much faster; raise the
+colcon worker count to match your cores and push the result to the tag the
+action pulls. [`containers/build-image.sh`](containers/build-image.sh) passes
+the per-distro build args and tags the image the way `build-images.yml` does:
+
+```bash
+containers/build-image.sh rolling source --build-arg PARALLEL_WORKERS=8
+# equivalent to: docker build -f containers/source.Dockerfile \
+#   --build-arg DISTRO=rolling --build-arg BASE_IMAGE=... (see distro-args.sh) \
+#   -t ghcr.io/fujitatomoya/ros-abi:rolling-source .
+
+echo "$GHCR_TOKEN" | docker login ghcr.io -u fujitatomoya --password-stdin
+docker push ghcr.io/fujitatomoya/ros-abi:rolling-source
+```
+
+`containers/build-image.sh <distro>` (no flavour) builds the binary image.
+
+`GHCR_TOKEN` is a personal access token with the `write:packages` scope. The
+tag belongs to the existing `ros-abi` package, so it inherits that package's
+(public) visibility and the `container:` step of the workflow can pull it
+anonymously. Expect roughly 40 GB of free disk during the build; the final
+image is a few GB. `docker run --rm -it ghcr.io/fujitatomoya/ros-abi:rolling-source
+cat /opt/ros2_ws/missing.txt` lists any package the build did not produce.
 
 `abidiff` itself is **not** required in the build image — the diff runs on the
 host runner, where `libabigail-action` installs it. Any image with (or able to
-rosdep-install) a `/opt/ros/<distro>` underlay works: the official
-`docker.io/library/ros` images work as-is, and the
+rosdep-install) a `/opt/ros/<distro>` underlay works in binary mode: the
+official `docker.io/library/ros` images work as-is, and the
 [`ros2dev`](https://github.com/fujitatomoya/ros2_devenv_builder) development
 images remain useful as an opt-in during Ubuntu-transition bootstrap windows
-when the official `rolling` image lags behind.
+when the official `rolling` image lags behind. A custom source-mode image must
+export `ROS_ABI_UNDERLAY` (setup.bash of its source workspace), `ROS_DISTRO`,
+and, for upstream sync, `ROS_ABI_SNAPSHOT` (a `vcs export --exact` of what it
+was built from) and `ROS_ABI_REPOS_URL` (the manifest to compare against).
 
 ---
 
@@ -163,14 +378,93 @@ covering common noise (`std::` template instantiation churn,
 both exist. The format follows libabigail's suppression spec
 (`man libabigail-suppr-spec`).
 
+The two type suppressions (`std::`, `detail`/`impl`/`internal`) carry
+`accessed_through = reference-or-pointer`: they apply when such a type is
+reached through a pointer or a reference, not when it is embedded by value.
+A `std::variant` member that gains an alternative grows the public class that
+holds it, and libabigail drops a class diff whose only changed member is
+suppressed, size change included, so without the restriction that break would
+be reported as compatible.
+
+Suppressions only reach declarations that carry debug info. libstdc++
+template instantiations that survive in the symbol table without DWARF
+(`std::variant`, `std::function`, … internals, listed by `abidiff` as
+"symbols not referenced by debug info") cannot be matched by any spec, and a
+renamed one would count as a removed symbol, i.e. an ABI break, even for a
+header-only change such as adding an alternative to a `std::variant` member.
+Both sides are always built with `-g` here, so the diff runs with
+`--no-unreferenced-symbols` (`unreferenced-symbols: 'false'` in
+`libabigail-action`) and those symbols are left out.
+
 ---
 
-## Multi-library repos
+## Public ABI: installed headers
 
-`soname` accepts a glob (e.g. `lib*.so`). The action expands it and runs the
-diff **once per matched library**, each with its own sticky-comment marker so
-they coexist on a single PR. Per-library verdicts are combined: under strict
-policy, if **any** library is incompatible, the workflow fails.
+A ROS 2 package installs `include/`; whatever lives under `src/` never reaches
+a user. A class defined in `src/foo/scheduler.hpp` and only held through a
+pointer (the pimpl idiom, executor internals, opaque handles) can therefore
+change its layout and gain or lose member functions without breaking any
+downstream binary. `abidiff` on its own compares the whole DWARF of the `.so`
+and reports every such change as a break (see
+[issue #15](https://github.com/fujitatomoya/ros2-abi-action/issues/15)).
+
+The action declares that policy once, mechanically, through
+`libabigail-action`'s `public-headers-regexp` input, set to `(^|/)include/`
+by default: a declaration is ABI only when the DWARF records it in a file
+whose path contains `include/`. That is true of the package's own headers in
+the checkout, of every dependency under `install/*/include`, of the source or
+binary underlay (`/opt/ros2_ws/...`, `/opt/ros/<distro>/include`) and of
+system headers, on both sides of the diff. Everything else is implementation:
+
+- a type defined there is ignored when reached through a pointer or a
+  reference (`std::unique_ptr<Impl>`, `Worker *`); embedded **by value** in a
+  public class it still changes that class's layout and is reported;
+- the member functions and static data members of such a class may be added,
+  removed or changed (`abidiff` cannot do this by itself; `libabigail-action`
+  generates a `[suppress_function]` / `[suppress_variable]` pair per private
+  class from `abidw` and adds it to the suppressions).
+
+The generated spec is printed in the diff job's log and uploaded with the
+report as `public-headers.abignore`. Repositories with another layout pass
+their own regexp; `''` turns the rule off.
+
+Two cases the rule does not cover, see
+[Known limitations](#known-limitations): a public class that gains a data
+member in the same change that modifies a private type it points to, and
+free functions declared only in a private header.
+
+---
+
+## Multi-package / multi-library repos
+
+`package` accepts a space-separated list. Because `--packages-up-to` only
+builds the dependency closure of the named packages, sibling packages that
+merely share a common dependency (e.g. `rclcpp_action`, `rclcpp_components`
+and `rclcpp_lifecycle`, which each depend on `rclcpp` but not on each other)
+must all be listed for their libraries to appear in `install/`. Listing them
+builds the union of closures **once per side**; shared dependencies are not
+rebuilt per package.
+
+`soname` accepts a glob (e.g. `lib*.so`). The action expands it against the
+install prefixes of the listed packages (`install/<package>/`, never against
+dependencies that happened to be rebuilt in the same workspace) and runs the
+diff **once per matched library**. Per-library verdicts are combined: under
+strict policy, if **any** library is incompatible, the workflow fails. With
+`publish: inline` every library gets its own sticky comment (distinct marker);
+with `publish: workflow-run` the report workflow posts a single comment with a
+per-library table and applies the labels from the worst verdict.
+
+For example, the `rclcpp` repository with
+`package: rclcpp rclcpp_action rclcpp_components rclcpp_lifecycle` and
+`soname: 'lib*.so'` yields one build per side and separate diff jobs for
+`librclcpp.so`, `librclcpp_action.so`, `librclcpp_lifecycle.so` and
+`libcomponent_manager.so` (test libraries are not built because the action sets
+`-DBUILD_TESTING=OFF`).
+
+Note that a single workflow file can call `check.yml` only once: the reusable
+workflow uploads its build artifacts under the fixed names `lib-base` / `lib-pr`
+which are shared across all jobs in a run, so two invocations would collide.
+Use the package list instead of multiple calls.
 
 ---
 
@@ -191,6 +485,7 @@ their own job. It resolves policy, merges suppressions, and delegates to
     distro: jazzy
     policy: auto
     suppressions: .abignore
+    public-headers-regexp: '(^|/)include/'   # the default; '' turns it off
 ```
 
 The reusable workflow `check.yml` is the recommended entry point for most repos;
@@ -198,19 +493,62 @@ it handles building both versions and multi-library glob expansion for you.
 
 ---
 
+## Pull requests from forks
+
+`check.yml` must build and diff the pull request's code. When that code comes
+from a fork, GitHub runs the `pull_request` workflow with a **read-only**
+`GITHUB_TOKEN` no matter what its `permissions:` block requests, so the diff
+jobs cannot write the comment or the labels; every attempt fails with
+`Resource not accessible by integration`. The ABI verdict and the pass/fail
+check are unaffected, and with `publish: inline` the failure is only a warning
+plus a hint in the job log.
+
+To publish for fork pull requests the write has to move to a workflow that
+never executes the pull request's code. That is `report.yml`:
+
+- it is triggered by `workflow_run` on the base repository when the check
+  workflow completes (whatever its conclusion), and always runs the workflow
+  file from the **default branch** with a normal write token;
+- it does no checkout at all; it downloads the check run's report bundles
+  (`abidiff-report.txt` + `verdict.json` per library, produced by
+  `libabigail-action`) and hands them to
+  [`libabigail-action/publish`](https://github.com/fujitatomoya/libabigail-action#fork-pull-requests);
+- the publisher resolves the pull request from the run's head commit (the
+  `workflow_run` payload lists no `pull_requests` for forks), posts **one**
+  sticky comment covering every library, and applies the labels from the worst
+  verdict. Only an open pull request still at that head is annotated, so an
+  older run never overwrites a newer result;
+- artifact content is treated as data: unknown verdicts become `error`, report
+  files are looked up by basename only, names are displayed as text.
+
+Wiring (see also [Quick start](#quick-start)):
+
+1. In the check workflow, set `publish: workflow-run`. The diff jobs then post
+   nothing, and `contents: read` is all the permission they need.
+2. Add `abi-report.yml` calling `report.yml` on `workflow_run` with
+   `pull-requests: write`, `issues: write` and `actions: read`.
+3. Merge both to the default branch: `workflow_run` workflows only start
+   firing once the file exists there, and the check run of a first-time
+   contributor still needs a maintainer's approval before anything happens.
+
+The check status on the pull request keeps coming from the check workflow; the
+report workflow only adds the comment and the labels.
+
+---
+
 ## Required permissions
 
-For the sticky comment and labels, the calling workflow must grant:
+`check.yml` declares no permissions of its own; it inherits what the caller
+grants, so the caller can be as narrow as the chosen publish mode allows:
 
-```yaml
-permissions:
-  contents: read
-  pull-requests: write
-  issues: write
-```
+| Mode | Check workflow (`check.yml`) | Report workflow (`report.yml`) |
+| --- | --- | --- |
+| `publish: inline` (same-repo PRs) | `contents: read`, `pull-requests: write`, `issues: write` | — |
+| `publish: workflow-run` (any PR) | `contents: read` | `contents: read`, `pull-requests: write`, `issues: write`, `actions: read` |
 
-If you only want the pass/fail check, set `comment-pr: false` and leave the
-labels at their defaults; then `contents: read` alone is enough.
+If you only want the pass/fail check, set `comment-pr: false`, leave the labels
+at their defaults, and stay on `publish: inline`; `contents: read` alone is
+enough.
 
 ---
 
@@ -221,6 +559,7 @@ updates:
 
 ```yaml
 uses: fujitatomoya/ros2-abi-action/.github/workflows/check.yml@v1
+uses: fujitatomoya/ros2-abi-action/.github/workflows/report.yml@v1
 ```
 
 The libabigail version is pinned via the container image; bumping it is a minor
@@ -239,6 +578,16 @@ release.
   without `-fvisibility=hidden` + explicit exports may see noisy reports.
 - **Plugin / nodelet-style libraries** without a stable public ABI surface should
   be excluded via `.abignore` or omitted from `soname`.
+- **A public class that gains a data member while a private type it points to
+  also changes is reported as compatible.** libabigail suppresses a diff node
+  whose changed children are all suppressed, and an inserted member or a size
+  change does not keep it alive (its sources call the rule "may be too
+  strong"). Keep layout changes of public classes in their own pull request,
+  or read the `(N filtered out)` counts in the report when a PR touches both.
+- **Free functions declared only in a private header** are still reported when
+  removed: DWARF records their definition in the `.cpp`, so they cannot be told
+  apart from public ones. Suppress them by name in the repository's
+  `.abignore`.
 
 ---
 
@@ -249,6 +598,29 @@ release.
 - MSVC / macOS — libabigail is ELF/DWARF only.
 - Replacing `industrial_ci` or `osrf/auto-abi-checker` — those remain useful for
   ABICC-based workflows.
+
+---
+
+## Development
+
+Every check that [`ci.yml`](.github/workflows/ci.yml) runs is a script under
+[`test/`](test/) that also runs locally; the workflow only provides the
+environment (a stub `colcon` for the build script, `vcstool` for the upstream
+sync, a bare Ubuntu container for the source toolchain):
+
+```bash
+shellcheck scripts/*.sh test/*.sh containers/*.sh
+ruff check scripts
+bash test/test-resolve.sh           # resolve-distro.sh, resolve-policy.sh
+bash test/test-related-prs.sh       # parse-related-prs.py
+bash test/test-locate-library.sh    # locate-library.sh
+bash test/test-colcon-build.sh      # colcon-build.sh with stub colcon/rosdep
+bash test/test-sync-upstream.sh     # sync-upstream.py (needs git + vcs)
+bash test/test-source-toolchain.sh  # build-underlay.sh / finalize (needs colcon)
+```
+
+The end-to-end self-test of the composite action (the `selftest` job) needs
+GitHub Actions and is not scripted.
 
 ## License
 
